@@ -2,7 +2,7 @@
 // @id              macos-minimize-animation
 // @name            MacOS Minimize Animation
 // @description     Smooth macOS-style genie minimize, restore (open) and optional close animations for every window.
-// @version         3.2.0-perf.1
+// @version         3.2.0-perf.2
 // @author          Abdullah Masood
 // @github          https://github.com/Abdullah-Masood-05
 // @include         *
@@ -119,6 +119,10 @@ make it open a second window. Thanks!
 - **Accurate targeting.** The mod locates the app's actual taskbar button via UI
   Automation and aims the genie at it (with a per-process fallback cache), instead
   of guessing from the cursor.
+- **Liman dock support.** When the Liman dock is running, the genie flows into (and back out of) the window's own dock icon,
+  for title-bar and keyboard minimizes too. Liman publishes its icon rectangles
+  in shared memory; the lookup costs microseconds and falls back to the taskbar
+  targeting above when Liman isn't running.
 - **Pixel-aligned capture.** The window is measured by its DWM extended frame
   bounds (not the legacy window rect), so keyboard / AutoHotkey minimizes are no
   longer spatially shifted.
@@ -351,7 +355,9 @@ struct MacGenieAnimData {
     int width;
     int height;
     int targetDockX;      // taskbar button X located via UI Automation
-    BOOL isRising;        // FALSE = minimize (flow in), TRUE = restore (flow out)
+    BOOL hasDockRect;     // TRUE = dockRect is the window's Liman dock icon: the
+    RECT dockRect;        // genie lands in / rises from that rect (caller coords)
+    BOOL isRising;      // FALSE = minimize (flow in), TRUE = restore (flow out)
     LONG_PTR originalExStyle;
     BOOL hiddenByCloak;   // rising only: TRUE = hidden via DWM cloak (restore and
                           // launch paths), FALSE = via WS_EX_LAYERED + alpha 0
@@ -701,6 +707,187 @@ HWND FindTaskbarForMonitor(HMONITOR hMon) {
     }
     return hMainTray;
 }
+
+// LIMAN-READER-BEGIN
+// --- Liman dock integration -------------------------------------------------
+// Liman (a macOS-style dock for Windows) publishes the screen rectangle of every
+// app's dock icon, keyed by the top-level windows shown under it, in a small
+// read-only shared-memory section. When it's running, the genie flows into (and
+// out of) the window's own dock icon. Protocol v1, fixed layout for 32- and 64-bit:
+//   header (48 bytes): u32 magic 'LIMN' (0x4E4D494C), u32 version (1), u32 seq
+//     (seqlock: odd while Liman writes), u32 count, u32 capacity, u32 entrySize
+//     (32), u32 ownerPid, u32 flags, u64 message hwnd, u64 reserved
+//   entry (entrySize bytes): u64 hwnd (low 32 bits significant), u32 pid,
+//     u32 slot (icon index), i32 left, top, right, bottom (physical pixels)
+// Lookup: the window, then its root owner, then its process id (only if every
+// entry of that process is under the same icon). Processes that can't open the
+// section (AppContainer) ask Liman's message window instead: registered message
+// "Liman.QueryIconRect", wParam = window, lParam 0 -> MAKELONG(left, top),
+// 1 -> MAKELONG(right, bottom), 0 = not found. Nothing is cached: a lookup opens,
+// scans and closes the section (a few microseconds), so a Liman restart or exit
+// is picked up on the next minimize.
+#ifndef LIMAN_SECTION_NAME
+#define LIMAN_SECTION_NAME L"Local\\Liman.IconRects.v1"
+#endif
+#ifndef LIMAN_WINDOW_CLASS
+#define LIMAN_WINDOW_CLASS L"Liman.Backdrop"
+#endif
+#define LIMAN_MAGIC         0x4E4D494Cu
+#define LIMAN_VERSION       1u
+#define LIMAN_QUERY_TIMEOUT 30   // ms, message fallback only
+
+struct LimanHeader {
+    UINT32 magic, version, seq, count, capacity, entrySize, ownerPid, flags;
+    UINT64 hwnd, reserved;
+};
+struct LimanEntry {
+    UINT64 hwnd;
+    UINT32 pid, slot;
+    INT32 left, top, right, bottom;
+};
+static_assert(sizeof(LimanHeader) == 48, "Liman header layout");
+static_assert(sizeof(LimanEntry) == 32, "Liman entry layout");
+
+// Shared-memory lookup. *openError is 0 when the section was opened, else the
+// OpenFileMappingW error (ERROR_FILE_NOT_FOUND = Liman isn't running).
+static bool LimanLookupSection(HWND hWnd, HWND hRoot, DWORD pid, RECT* out, DWORD* openError) {
+    HANDLE hMap = OpenFileMappingW(FILE_MAP_READ, FALSE, LIMAN_SECTION_NAME);
+    if (!hMap) { *openError = GetLastError(); if (!*openError) *openError = ERROR_FILE_NOT_FOUND; return false; }
+    *openError = 0;
+    bool found = false;
+    const BYTE* base = (const BYTE*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+    if (base) {
+        MEMORY_BASIC_INFORMATION mbi;
+        SIZE_T viewSize = VirtualQuery(base, &mbi, sizeof(mbi)) ? mbi.RegionSize : 0;
+        volatile const LimanHeader* h = (volatile const LimanHeader*)base;
+        if (viewSize >= sizeof(LimanHeader) && h->magic == LIMAN_MAGIC &&
+            h->version == LIMAN_VERSION && h->entrySize >= sizeof(LimanEntry)) {
+            const UINT32 entrySize = h->entrySize;
+            const SIZE_T maxEntries = (viewSize - sizeof(LimanHeader)) / entrySize;
+            const UINT32 wantWnd = (UINT32)(UINT_PTR)hWnd, wantRoot = (UINT32)(UINT_PTR)hRoot;
+            for (int attempt = 0; attempt < 100; attempt++) {
+                const UINT32 s1 = h->seq;
+                if (s1 & 1) { YieldProcessor(); continue; }   // Liman is mid-update
+                std::atomic_thread_fence(std::memory_order_acquire);
+                SIZE_T n = h->count;
+                if (n > maxEntries) n = maxEntries;
+                int exact = -1, root = -1, byPid = -1;
+                bool pidAmbiguous = false;
+                for (SIZE_T i = 0; i < n; i++) {
+                    volatile const LimanEntry* e =
+                        (volatile const LimanEntry*)(base + sizeof(LimanHeader) + i * entrySize);
+                    const UINT32 eh = (UINT32)e->hwnd;
+                    if (eh == wantWnd) { exact = (int)i; break; }
+                    if (root < 0 && hRoot && eh == wantRoot) root = (int)i;
+                    if (pid && e->pid == pid) {
+                        if (byPid < 0) byPid = (int)i;
+                        else if (((volatile const LimanEntry*)(base + sizeof(LimanHeader) +
+                                  (SIZE_T)byPid * entrySize))->slot != e->slot) pidAmbiguous = true;
+                    }
+                }
+                const int pick = exact >= 0 ? exact : root >= 0 ? root : (!pidAmbiguous ? byPid : -1);
+                RECT r = {0, 0, 0, 0};
+                if (pick >= 0) {
+                    volatile const LimanEntry* e =
+                        (volatile const LimanEntry*)(base + sizeof(LimanHeader) + (SIZE_T)pick * entrySize);
+                    r.left = e->left; r.top = e->top; r.right = e->right; r.bottom = e->bottom;
+                }
+                std::atomic_thread_fence(std::memory_order_acquire);
+                if (h->seq != s1) continue;                    // torn: Liman wrote meanwhile
+                found = pick >= 0;
+                if (found) *out = r;
+                break;
+            }
+        }
+        UnmapViewOfFile(base);
+    }
+    CloseHandle(hMap);
+    return found;
+}
+
+static bool LimanInAppContainer() {
+    static const bool inAppContainer = [] {
+        HANDLE hToken = NULL;
+        DWORD isAc = 0, len = 0;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+            if (!GetTokenInformation(hToken, TokenIsAppContainer, &isAc, sizeof(isAc), &len)) isAc = 0;
+            CloseHandle(hToken);
+        }
+        return isAc != 0;
+    }();
+    return inAppContainer;
+}
+
+// Message fallback (Liman lets this message through UIPI): two short round trips.
+static bool LimanLookupMessage(HWND hWnd, RECT* out) {
+    HWND hLiman = FindWindowW(LIMAN_WINDOW_CLASS, NULL);
+    if (!hLiman) return false;
+    static const UINT msg = RegisterWindowMessageW(L"Liman.QueryIconRect");
+    if (!msg) return false;
+    DWORD_PTR rb = 0, lt = 0;
+    if (!SendMessageTimeoutW(hLiman, msg, (WPARAM)hWnd, 1, SMTO_ABORTIFHUNG, LIMAN_QUERY_TIMEOUT, &rb) || !rb)
+        return false;
+    if (!SendMessageTimeoutW(hLiman, msg, (WPARAM)hWnd, 0, SMTO_ABORTIFHUNG, LIMAN_QUERY_TIMEOUT, &lt))
+        return false;
+    out->left   = (SHORT)LOWORD((DWORD)lt);
+    out->top    = (SHORT)HIWORD((DWORD)lt);
+    out->right  = (SHORT)LOWORD((DWORD)rb);
+    out->bottom = (SHORT)HIWORD((DWORD)rb);
+    return true;
+}
+
+// Liman publishes physical pixels; a DPI-unaware or system-aware thread works in
+// its own scaled coordinates (monitor info, the ghost window), so map the rect
+// from the icon monitor's physical rect onto that same monitor's rect as this
+// thread sees it.
+static void LimanRectToCallerDpi(RECT* r) {
+    typedef DPI_AWARENESS_CONTEXT (WINAPI *GetThreadDpiAwarenessContext_t)();
+    typedef DPI_AWARENESS_CONTEXT (WINAPI *SetThreadDpiAwarenessContext_t)(DPI_AWARENESS_CONTEXT);
+    typedef DPI_AWARENESS (WINAPI *GetAwarenessFromDpiAwarenessContext_t)(DPI_AWARENESS_CONTEXT);
+    static const HMODULE hUser = GetModuleHandleW(L"user32.dll");
+    static const auto pGetCtx = (GetThreadDpiAwarenessContext_t)(void*)GetProcAddress(hUser, "GetThreadDpiAwarenessContext");
+    static const auto pSetCtx = (SetThreadDpiAwarenessContext_t)(void*)GetProcAddress(hUser, "SetThreadDpiAwarenessContext");
+    static const auto pGetAw = (GetAwarenessFromDpiAwarenessContext_t)(void*)GetProcAddress(hUser, "GetAwarenessFromDpiAwarenessContext");
+    if (!pGetCtx || !pSetCtx || !pGetAw) return;
+    const DPI_AWARENESS aw = pGetAw(pGetCtx());
+    if (aw != DPI_AWARENESS_UNAWARE && aw != DPI_AWARENESS_SYSTEM_AWARE) return;
+    MONITORINFO phys = {}, mine = {};
+    phys.cbSize = mine.cbSize = sizeof(MONITORINFO);
+    DPI_AWARENESS_CONTEXT prev = pSetCtx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    if (!prev) return;
+    HMONITOR hm = MonitorFromRect(r, MONITOR_DEFAULTTONEAREST);
+    const bool okPhys = GetMonitorInfoW(hm, &phys);
+    pSetCtx(prev);
+    if (!okPhys || !GetMonitorInfoW(hm, &mine)) return;
+    const int pw = phys.rcMonitor.right - phys.rcMonitor.left, ph = phys.rcMonitor.bottom - phys.rcMonitor.top;
+    const int mw = mine.rcMonitor.right - mine.rcMonitor.left, mh = mine.rcMonitor.bottom - mine.rcMonitor.top;
+    if (pw <= 0 || ph <= 0 || mw <= 0 || mh <= 0 || (pw == mw && ph == mh && phys.rcMonitor.left == mine.rcMonitor.left &&
+                                                     phys.rcMonitor.top == mine.rcMonitor.top)) return;
+    r->left   = mine.rcMonitor.left + MulDiv(r->left   - phys.rcMonitor.left, mw, pw);
+    r->right  = mine.rcMonitor.left + MulDiv(r->right  - phys.rcMonitor.left, mw, pw);
+    r->top    = mine.rcMonitor.top  + MulDiv(r->top    - phys.rcMonitor.top,  mh, ph);
+    r->bottom = mine.rcMonitor.top  + MulDiv(r->bottom - phys.rcMonitor.top,  mh, ph);
+}
+
+// The window's Liman dock icon in the caller's coordinates; false when Liman isn't
+// running or doesn't show this window.
+static bool LimanGetIconRect(HWND hWnd, RECT* out) {
+    if (!hWnd) return false;
+    HWND hRoot = GetAncestor(hWnd, GA_ROOTOWNER);
+    if (hRoot == hWnd) hRoot = NULL;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hWnd, &pid);
+    DWORD openError = 0;
+    RECT r;
+    bool ok = LimanLookupSection(hWnd, hRoot, pid, &r, &openError);
+    if (!ok && openError && (openError == ERROR_ACCESS_DENIED || LimanInAppContainer()))
+        ok = LimanLookupMessage(hWnd, &r);
+    if (!ok || r.right <= r.left || r.bottom <= r.top) return false;
+    LimanRectToCallerDpi(&r);
+    *out = r;
+    return true;
+}
+// LIMAN-READER-END
 
 // Ported from Potassiumuncher's genie engine (github.com/Potassiumuncher).
 // Locates the app's taskbar button via UI Automation and returns its center X
@@ -1097,6 +1284,13 @@ DWORD WINAPI MacGenieAnimThread(LPVOID lpParam) {
         22.0f,
         scaledIconSize
     };
+    // Liman dock: the lamp curve funnels into the icon's own rectangle.
+    if (data->hasDockRect && !data->isClosing) {
+        iGeom.x = (float)data->dockRect.left;
+        iGeom.y = (float)data->dockRect.top;
+        iGeom.width = (float)(data->dockRect.right - data->dockRect.left);
+        iGeom.height = (float)(data->dockRect.bottom - data->dockRect.top);
+    }
     // Close animation: flow to the middle of the chosen screen edge instead of
     // the taskbar button (MrCrustyToast's close targets).
     if (data->isClosing) {
@@ -1639,12 +1833,36 @@ DWORD WINAPI MacGenieAnimThreadClassic(LPVOID lpParam) {
     // outside the window's own vertical span so the yb[] map below stays
     // monotonic (a hard requirement of the scanline walk).
     const float origBottomF = (float)(origTop + H);
-    const bool dockAbove = dockY < ((float)origTop + origBottomF) * 0.5f;
-    if (dockAbove) { if (dockY > (float)origTop) dockY = (float)origTop; }
-    else           { if (dockY < origBottomF)    dockY = origBottomF; }
+    const float origMidF = ((float)origTop + origBottomF) * 0.5f;
+    // Liman dock: land IN the icon - the rows map onto the icon's height and the
+    // neck narrows to its width - instead of on one line at the screen edge, as
+    // long as that keeps yb[] monotonic: the band [top, bottom] must lie on the
+    // dock side of the window's own top and bottom. Otherwise (a window hanging
+    // over a floating dock) it is the old single-line funnel through the icon.
+    float dockY2 = dockY;   // landing band [dockY, dockY2]; a line when equal
+    bool iconBand = false;
+    if (data->hasDockRect && !data->isClosing) {
+        const float bt = (float)data->dockRect.top, bb = (float)data->dockRect.bottom;
+        const bool above = (bt + bb) * 0.5f < origMidF;
+        if (above ? (bt <= (float)origTop && bb <= origBottomF)
+                  : (bt >= (float)origTop && bb >= origBottomF)) {
+            dockY = bt;
+            dockY2 = bb;
+            iconBand = true;
+        } else {
+            dockY = dockY2 = (bt + bb) * 0.5f;
+        }
+    }
+    const bool dockAbove = (dockY + dockY2) * 0.5f < origMidF;
+    if (!iconBand) {
+        if (dockAbove) { if (dockY > (float)origTop) dockY = (float)origTop; }
+        else           { if (dockY < origBottomF)    dockY = origBottomF; }
+        dockY2 = dockY;
+    }
     float neckW = W * 0.03f;
     if (neckW < 12.0f) neckW = 12.0f;
     if (neckW > 60.0f) neckW = 60.0f;
+    if (iconBand) neckW = (float)(data->dockRect.right - data->dockRect.left);
 
     // Bounding box the funnel can occupy. Both the window's own monitor and the
     // monitor it funnels to are unioned; the box is trimmed to them but never
@@ -1656,7 +1874,7 @@ DWORD WINAPI MacGenieAnimThreadClassic(LPVOID lpParam) {
     // Span from the dock edge up/down to the window so a top taskbar (dock above
     // the window) is inside the canvas instead of below the box.
     int boundTop    = std::min<int>(origTop, (int)dockY);
-    int boundBottom = std::max<int>(origTop + H, (int)dockY);
+    int boundBottom = std::max<int>(origTop + H, (int)ceilf(dockY2));
     RECT monUnion = GetGenieMonitorUnion(data->targetRect, data->hMon);
     ClampGenieCanvas(boundLeft, boundTop, boundRight, boundBottom,
                      data->targetRect, dockX, monUnion);
@@ -1806,7 +2024,8 @@ DWORD WINAPI MacGenieAnimThreadClassic(LPVOID lpParam) {
             float v = (float)k / (float)H;
             float e = morphAt(dockAbove ? (1.0f - v) : v, tt);
             float idY = (float)origTop + (float)H * v;
-            yb[k] = idY + (dockY - idY) * e;
+            float landY = dockY + (dockY2 - dockY) * v;   // == dockY without a band
+            yb[k] = idY + (landY - idY) * e;
         }
 
         RECT dirty = { boundW, boundH, 0, 0 };   // bounding box of the rows that changed
@@ -2150,6 +2369,13 @@ bool StartMacGenieAnim(HWND hWnd, BOOL rising, LONG_PTR originalExStyle,
     HMONITOR hMon = multiMon
         ? MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST)
         : MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+
+    // Liman dock running and showing this window: its icon is the exact target
+    // (minimize and restore alike), ahead of the cursor / UI Automation guesses
+    // below, which only know the native taskbar. Its monitor is the dock monitor.
+    RECT limanRect = {0, 0, 0, 0};
+    const bool haveLiman = !isClosing && LimanGetIconRect(hWnd, &limanRect);
+    if (haveLiman) hMon = MonitorFromRect(&limanRect, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi;
     mi.cbSize = sizeof(mi);
     if (!GetMonitorInfoW(hMon, &mi)) {
@@ -2164,7 +2390,9 @@ bool StartMacGenieAnim(HWND hWnd, BOOL rising, LONG_PTR originalExStyle,
     // A close doesn't target the taskbar (the render thread picks the edge from the
     // close-direction setting), so it skips the registry, cursor and UIA lookups.
     int learnedTargetX = mi.rcMonitor.left + monWidth / 2;
-    if (!isClosing) {
+    if (haveLiman) {
+        learnedTargetX = limanRect.left + (limanRect.right - limanRect.left) / 2;
+    } else if (!isClosing) {
         DWORD alignVal = 1, dataSize = sizeof(alignVal);
         RegGetValueW(HKEY_CURRENT_USER,
                      L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
@@ -2220,6 +2448,8 @@ bool StartMacGenieAnim(HWND hWnd, BOOL rising, LONG_PTR originalExStyle,
     data->height = h;
     data->isRising = rising;
     data->targetDockX = learnedTargetX;
+    data->hasDockRect = haveLiman;
+    data->dockRect = limanRect;
     data->originalExStyle = originalExStyle;
     data->hiddenByCloak = cloakHidden;
     data->hFirstFrameShown = NULL;
