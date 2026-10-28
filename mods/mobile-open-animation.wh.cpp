@@ -4,7 +4,7 @@
 // @name:zh-CN      移动端风格的窗口打开动画
 // @description     App windows zoom open from the icon (cursor position) with a fade, phone-style, using a splash panel with the app icon.
 // @description:zh-CN 让应用窗口像手机桌面那样从你点击的图标处放大铺开并淡入：用一块带应用图标的占位面板做展开动画，等真窗口画好再交接。
-// @version         1.0.0
+// @version         1.0.0-perf.1
 // @author          Nico6719
 // @github          https://github.com/Nico6719
 // @include         *
@@ -1211,6 +1211,81 @@ static float QpcSinceMs(ULONGLONG from) {
 // makes the animation look coarser than the UI around it. DWM's composition
 // cadence is asked first, since it is what actually decides when a frame reaches
 // the screen, then the display mode's refresh rate, then 60Hz.
+
+// Frame pacing on the compositor's clock. With the frame interval left at 0
+// ("follow the refresh rate") a fixed Sleep of the rounded period (17 ms at 60 Hz,
+// with 1 ms timer granularity) drifts against the real refresh, so now and then a
+// refresh shows the previous frame again and the next one jumps - measured ~2
+// repeated frames per launch on a 60 Hz panel. Instead every frame is started
+// ~1 ms after a vblank taken from DWM's composition timing: one new frame per
+// refresh, always sampled at the same phase. It also follows Windows 11's dynamic
+// refresh rate (60 <-> 120 Hz), which the display mode doesn't report.
+
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+// QPC time ~1 ms after the first vblank at least 0.5 ms from now, or 0 when DWM's
+// timing is not available.
+static ULONGLONG NextVBlankSlotQpc() {
+    DWM_TIMING_INFO ti = {};
+    ti.cbSize = sizeof(ti);
+    if (FAILED(DwmGetCompositionTimingInfo(nullptr, &ti))) return 0;
+    const LONGLONG freq = (LONGLONG)QpcFreq();
+    LONGLONG per = (LONGLONG)ti.qpcRefreshPeriod;
+    if (per <= 0 && ti.rateRefresh.uiNumerator) {
+        per = (LONGLONG)((double)freq * ti.rateRefresh.uiDenominator / ti.rateRefresh.uiNumerator);
+    }
+    if (per < freq / 500 || per > freq / 20) return 0;   // outside 20..500 Hz: not trusted
+    const LONGLONG vb = (LONGLONG)ti.qpcVBlank;
+    if (vb <= 0) return 0;
+    const LONGLONG now = (LONGLONG)QpcNow();
+    const LONGLONG off = freq / 1000;
+    const LONGLONG guard = freq / 2000;
+    LONGLONG target = vb + off;
+    if (target <= now + guard) target += ((now + guard - target) / per + 1) * per;
+    else if (target - per > now + guard) target -= ((target - (now + guard)) / per) * per;
+    return (ULONGLONG)target;
+}
+
+// High-resolution one-shot timer for the pacer, or nullptr (then Sleep is used).
+static HANDLE CreateFrameTimer() {
+    HANDLE t = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                      TIMER_MODIFY_STATE | SYNCHRONIZE);
+    if (!t) t = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_MODIFY_STATE | SYNCHRONIZE);
+    return t;
+}
+
+// Waits for the next frame. autoInterval: the user left the frame interval at 0, so
+// frames follow the vblank clock; otherwise (or without DWM timing) the configured
+// fixed interval is slept as before. Never waits longer than 100 ms.
+static void PaceNextFrame(HANDLE timer, bool autoInterval, ULONGLONG frameStart,
+                          float intervalMs) {
+    if (autoInterval) {
+        const ULONGLONG target = NextVBlankSlotQpc();
+        if (target) {
+            const ULONGLONG now = QpcNow();
+            float waitMs = target > now ? QpcMs(now, target) : 0.0f;
+            if (waitMs > 100.0f) waitMs = 100.0f;
+            if (waitMs > 0.1f) {
+                if (timer) {
+                    LARGE_INTEGER due;
+                    due.QuadPart = -(LONGLONG)(waitMs * 10000.0f);   // 100 ns units
+                    if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+                        WaitForSingleObject(timer, 100);
+                        return;
+                    }
+                }
+                Sleep((DWORD)lround(waitMs));
+            } else {
+                SwitchToThread();
+            }
+            return;
+        }
+    }
+    const float spentMs = QpcSinceMs(frameStart);
+    Sleep(spentMs + 0.5f < intervalMs ? (DWORD)lround(intervalMs - spentMs) : 1);
+}
 
 // Uses the refresh rate straight from the display mode, in Hz, with 60Hz as the fallback.
 static float GetDisplayPeriodMs(HWND hwnd) {
@@ -2779,6 +2854,8 @@ static void RunSplashZoom(AnimSlot* slot, HWND hwnd) {
     const int startRadius = slot->params.startSizePx * 22 / 100;
     int frames = 0;
     slot->raiseEachFrame = true;  // during the zoom, fight the app's own splash screen for z-order
+    HANDLE frameTimer = CreateFrameTimer();
+    const bool autoInterval = slot->params.frameIntervalMs <= 0;
 
     for (;;) {
         const ULONGLONG frameStart = QpcNow();
@@ -2798,10 +2875,9 @@ static void RunSplashZoom(AnimSlot* slot, HWND hwnd) {
         if (!IsWindow(slot->splash) || !IsWindow(hwnd)) break;
         if (done || g_unloading.load(std::memory_order_relaxed)) break;
 
-        const float spentMs = QpcSinceMs(frameStart);
-        const float interval = (float)slot->frameIntervalMs;
-        Sleep(spentMs + 0.5f < interval ? (DWORD)lround(interval - spentMs) : 1);
+        PaceNextFrame(frameTimer, autoInterval, frameStart, (float)slot->frameIntervalMs);
     }
+    if (frameTimer) CloseHandle(frameTimer);
 
     const float totalMs = QpcSinceMs(t0);
     Wh_Log(L"  zoom done: %d frames in %.1f ms (%.1f fps, target %.1f ms/frame); "
@@ -2863,6 +2939,8 @@ static void RunFadeOutPanel(AnimSlot* slot, uint32_t bgTo) {
     // straight out, and the tail still runs DestroySplash and ReleaseSlot.
     const ULONGLONG wall = GetTickCount64() + kHandoffWallClockMs;
     bool outOfTime = false;
+    HANDLE frameTimer = CreateFrameTimer();
+    const bool autoInterval = slot->params.frameIntervalMs <= 0;
 
     for (;;) {
         const ULONGLONG frameStart = QpcNow();
@@ -2881,10 +2959,9 @@ static void RunFadeOutPanel(AnimSlot* slot, uint32_t bgTo) {
             break;
         }
 
-        const float spentMs = QpcSinceMs(frameStart);
-        const float interval = (float)slot->frameIntervalMs;
-        Sleep(spentMs + 0.5f < interval ? (DWORD)lround(interval - spentMs) : 1);
+        PaceNextFrame(frameTimer, autoInterval, frameStart, (float)slot->frameIntervalMs);
     }
+    if (frameTimer) CloseHandle(frameTimer);
     if (outOfTime) {
         Wh_Log(L"  !! handoff fade still running after %llu ms, forcing the teardown",
              (unsigned long long)kHandoffWallClockMs);
@@ -3041,6 +3118,21 @@ static DWORD WINAPI AnimationThread(LPVOID param) {
     // thread and not for the process lifetime: the mod is loaded into a hundred
     // processes, and the system timer runs at the highest resolution anyone asks for.
     timeBeginPeriod(1);
+    // Latency-bound and short-lived: opt this thread out of EcoQoS (execution-speed
+    // power throttling), which on battery parks background threads on efficiency
+    // cores at low clocks. Thread-level only; looked up at run time.
+    {
+        typedef BOOL(WINAPI * SetThreadInformation_t)(HANDLE, int, LPVOID, DWORD);
+        static SetThreadInformation_t pSet = (SetThreadInformation_t)GetProcAddress(
+            GetModuleHandleW(L"kernel32.dll"), "SetThreadInformation");
+        if (pSet) {
+            THREAD_POWER_THROTTLING_STATE s = {};
+            s.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+            s.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+            s.StateMask = 0;
+            pSet(GetCurrentThread(), 3 /* ThreadPowerThrottling */, &s, sizeof(s));
+        }
+    }
     RunAnimationBody(slot, hwnd);
     timeEndPeriod(1);
 
